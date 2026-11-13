@@ -131,6 +131,37 @@ Outputs execution latency metrics and tracemalloc peak memory to `results/scorer
 
 ---
 
+## Queue Policy and Downlink Model
+
+### 1. Bounded Priority Queue Policy (`BoundedPriorityQueue`)
+The onboard queue enforces a strict physical memory cap in bytes (`max_bytes`), where each tile consumes `tile.size_bytes` (`H * W * C * 2` bytes for `uint16`).
+
+- **Admission & Eviction**:
+  - When the queue has sufficient capacity, tiles are admitted immediately (`pushed` counter incremented).
+  - If a tile exceeds available capacity, the queue attempts to make room by evicting the lowest-priority tiles currently in the queue.
+  - If the lowest-priority tiles have a lower priority than the incoming tile, they are evicted (`evicted` counter incremented) until enough bytes are freed.
+  - If the incoming tile's priority is lower than or equal to the lowest-priority item (or if evicting all lower-priority items still cannot free enough bytes), the incoming tile is rejected (`rejected` counter incremented).
+- **Deterministic Tie-Breaking**:
+  1. Higher priority score first.
+  2. Earlier capture timestamp first (`tile.timestamp`).
+  3. Lexicographically smaller `tile_id` first.
+- **Implementation**: Implemented using standard library `heapq` with dual min/max tracking and lazy deletion for optimal performance and zero external dependencies.
+
+### 2. Downlink Simulator Model (`DownlinkSimulator`)
+Downlink passes represent ground station contact windows defined by `Pass(start_s, duration_s, bandwidth_bytes_per_s)`.
+- **Pass Capacity**: Total data budget per pass is `duration_s * bandwidth_bytes_per_s`.
+- **Atomicity**: Partial tiles are **never** transmitted. A tile is only downlinked if its full byte size fits within the remaining capacity of an active pass.
+- **Retention**: Tiles that do not fit in the current pass remain in the priority queue for subsequent passes.
+- **Delivered Telemetry**: Each transmitted tile records its delivery timestamp `sent_at_s` and latency `delay_s_since_capture = sent_at_s - tile.timestamp`.
+
+### 3. What is NOT Modelled
+To maintain clean abstraction boundaries and deterministic benchmarking, the following physical/operational factors are deliberately excluded:
+- **Onboard Tile Compression**: Tiles are stored and transmitted as raw uncompressed arrays (`uint16`); variable-bitrate image compression (e.g., JPEG2000, CCSDS 122.0) is not simulated.
+- **Orbital Geo-Visibility & Elevation**: Contact windows are modelled as rectangular step functions with constant bandwidth, rather than dynamic RF link budgets varying with satellite elevation and antenna look angles.
+- **Atmospheric Attenuation & Retransmission**: Packet loss, bit errors, rain fade, and ARQ retransmission protocols are not modelled; passes deliver all budgeted bytes error-free.
+
+---
+
 ## Project Status
 
 ### Step 0: Scaffolding (Completed)
@@ -150,7 +181,12 @@ Outputs execution latency metrics and tracemalloc peak memory to `results/scorer
 - Scorer registry with canonical names (`s1`, `s2`, `s2_mean`, `random`, `fifo`) and alias mapping.
 - Two-pass `benchmark_scorer` harness and CLI (`python -m capstone.scorers.timing --scorers ...`).
 
-### Not Done / Next Steps (Step 3+)
-- Bounded priority queue and onboard pipeline orchestrator.
-- Downlink simulator with pass windows and bandwidth budgets.
-- Experiment orchestration and metric logging against ground truth.
+### Step 3: Priority Queue, Downlink Simulator & Pipeline Runner (Completed)
+- `BoundedPriorityQueue`: Byte-constrained priority queue with deterministic tie-breaking (score -> timestamp -> tile_id) and eviction tracking using heapq with lazy deletion.
+- `DownlinkSimulator`: Scheduled pass simulator enforcing atomic tile transfers and bandwidth budgets.
+- `run_pipeline`: Deterministic streaming pipeline orchestrator returning comprehensive `RunResult`.
+- Full test suite verifying capacity enforcement, eviction fidelity, pass limits, and end-to-end determinism.
+
+### Not Done / Next Steps (Step 4+)
+- Experiment configuration harness (YAML-driven configs).
+- Metrics evaluation (cumulative value downlinked, latency distributions, ground truth comparison).
