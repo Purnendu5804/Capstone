@@ -20,6 +20,9 @@ make test
 
 # Run code style and lint checks
 make lint
+
+# Benchmark scorers on 256x256 synthetic tiles and output results to results/
+python -m capstone.scorers.timing
 ```
 
 ## Slicer Interface Specification (Tile Format)
@@ -65,26 +68,82 @@ To stand in for the real slicer's output, a folder must contain:
 
 ---
 
+## Scorers and Registry
+
+Scorers compute an onboard priority score (`float`) for each tile. Higher scores denote higher priority for downlink.
+
+### Built-in Scorers
+
+1. **S1 Variance (`S1VarianceScorer`)**:
+   - Computes the pixel variance of a single spectral band in `float64` (default `"B08"`, falls back to channel 0).
+   - Serves as a fast indicator of surface texture and land heterogeneity.
+2. **S2 Edge Density (`S2EdgeScorer`)**:
+   - Computes the mean Sobel gradient magnitude (`skimage.filters.sobel`) on the target band.
+   - Normalized by a configurable reflectance constant (default `10000.0`) so scores are independent of absolute scene illumination.
+3. **Random Baseline (`RandomScorer`)**:
+   - Generates pseudo-random priority scores from uniform $[0.0, 1.0)$ using an explicit seed.
+4. **FIFO Baseline (`FifoScorer`)**:
+   - Assigns priority based on capture order (`-tile.timestamp`), ensuring earlier tiles receive higher scores.
+
+### Scorer Protocol & Timing Harness
+
+All scorers conform to the `Scorer` Protocol:
+```python
+class Scorer(Protocol):
+    name: str
+    def score(self, tile: Tile) -> float: ...
+```
+
+The helper `timed_score(scorer, tile) -> ScoreResult` measures execution cost in nanoseconds using `time.perf_counter_ns` (including preprocessing) and returns a validated `ScoreResult`.
+
+### Registry & Plugging in External Models
+
+Scorers are constructed dynamically using `build_scorer(name, **kwargs)`. Teammates can register external lightweight or preview models without modifying pipeline logic:
+
+```python
+from capstone.contracts.types import Tile
+from capstone.scorers import register_scorer
+
+class TeammatePreviewScorer:
+    name = "s3_preview"
+
+    def score(self, tile: Tile) -> float:
+        # Preprocessing & inference logic
+        return 0.85
+
+# Register with the pipeline
+register_scorer("s3", TeammatePreviewScorer)
+```
+
+### Benchmarking CLI
+
+Benchmark scorer throughput and memory overhead using synthetic tiles:
+```bash
+python -m capstone.scorers.timing --num-tiles 10 --height 256 --width 256 --repeats 20
+```
+This runs warmup and repeated measurements, records `mean`, `median`, `p95` latencies, and tracemalloc peak memory, and writes output to `results/scorer_benchmarks.csv`.
+
+---
+
 ## Project Status
 
 ### Step 0: Scaffolding (Completed)
 - Initial repository layout, packaging, `pyproject.toml`, and Makefile.
 
 ### Step 1 & 1.5: Contracts and Tile Sources (Completed)
-- **Contracts (`src/capstone/contracts/`)**:
-  - `Tile`: Frozen dataclass with read-only pixel arrays (`flags.writeable = False`), `__hash__` on `tile_id`, and strict validation.
-  - `ScoreResult`: Frozen dataclass capturing raw, scorer-specific scores and execution latencies.
-  - `TileSource`: Protocol defining `tiles() -> Iterator[Tile]`.
-  - `LabeledTileSource`: Protocol defining `TileSource` with `value(tile_id: str) -> float`.
-- **Sources (`src/capstone/sources/`)**:
-  - `SyntheticTileSource`: Seeded deterministic generator with random choice across 5 distinct synthetic patterns (flat clear land, textured land, strong edges, pure sensor noise, uniform bright cloud) with decoupled ground truth values. Docstring warning specifies it is for plumbing tests only.
-  - `FolderTileSource`: Ingestion of `.npy` tiles with `manifest.csv` (duplicate detection) and optional `labels.csv`.
-  - `save_tiles_to_folder`: Utility for writing tile files, manifests, and optional labels.
-- **Dependencies**:
-  - `pyproject.toml` isolates `pytest` and `ruff` under `[project.optional-dependencies] dev`, installed via `make install`.
+- `Tile` contract with strict validation, read-only pixel enforcement, and hashing.
+- `ScoreResult` contract with documentation on scorer-relative scores.
+- `SyntheticTileSource` with 5 decoupled test patterns and `FolderTileSource` with `manifest.csv` / `labels.csv`.
 
-### Not Done / Next Steps (Step 2+)
-- Scorers implementation (S1 pixel variance, S2 Sobel edge density, S3 mock preview model).
+### Step 2: Scorers, Baselines & Timing Harness (Completed)
+- `Scorer` Protocol and `timed_score` latency measurement harness.
+- `S1VarianceScorer`: Configurable band variance in float64.
+- `S2EdgeScorer`: Normalized mean Sobel edge gradient magnitude.
+- `RandomScorer` (seeded) and `FifoScorer` (capture order) baselines.
+- Extensible scorer registry with `build_scorer` and `register_scorer`.
+- `benchmark_scorer` harness and CLI (`python -m capstone.scorers.timing`) outputting to `results/scorer_benchmarks.csv`.
+
+### Not Done / Next Steps (Step 3+)
 - Bounded priority queue and onboard pipeline orchestrator.
 - Downlink simulator with pass windows and bandwidth budgets.
-- Metrics evaluation and experiment harness.
+- Experiment orchestration and metric logging against ground truth.
