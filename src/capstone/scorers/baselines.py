@@ -2,26 +2,25 @@
 
 from __future__ import annotations
 
-import numpy as np
+import hashlib
 
 from capstone.contracts.types import Tile
 
 
 class RandomScorer:
-    """Assigns pseudo-random scores using an explicit seed."""
+    """Assigns pseudo-random scores as a pure function of (seed, tile_id)."""
 
     def __init__(self, seed: int = 42, name: str = "random") -> None:
         self.seed = seed
         self.name = name
-        self._rng = np.random.default_rng(seed)
 
     def score(self, tile: Tile) -> float:
-        """Draw a uniform random float in [0.0, 1.0) as the tile score."""
-        return float(self._rng.uniform(0.0, 1.0))
-
-    def reset(self) -> None:
-        """Reset the internal generator to the initial seed state."""
-        self._rng = np.random.default_rng(self.seed)
+        """Map (seed, tile_id) stably via blake2b to a float in [0.0, 1.0)."""
+        key = f"{self.seed}:{tile.tile_id}".encode()
+        digest = hashlib.blake2b(key, digest_size=8).digest()
+        int_val = int.from_bytes(digest, byteorder="big")
+        # Map 64-bit unsigned integer to [0.0, 1.0)
+        return float(int_val / (2**64))
 
 
 class FifoScorer:

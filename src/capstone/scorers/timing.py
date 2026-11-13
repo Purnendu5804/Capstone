@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import time
 import tracemalloc
 from collections.abc import Iterable
 from pathlib import Path
@@ -13,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from capstone.contracts.types import Tile
-from capstone.scorers.base import Scorer
+from capstone.scorers.base import Scorer, timed_score
 from capstone.scorers.registry import build_scorer
 from capstone.sources.synthetic import SyntheticTileSource
 
@@ -24,7 +23,7 @@ def benchmark_scorer(
     warmup: int = 5,
     repeats: int = 20,
 ) -> dict[str, Any]:
-    """Benchmark scorer latency and memory usage across a collection of tiles."""
+    """Benchmark scorer latency and peak memory usage in two separate passes."""
     tiles_list = list(tiles)
     if not tiles_list:
         raise ValueError("Cannot benchmark on empty tiles collection")
@@ -38,24 +37,24 @@ def benchmark_scorer(
             if warmup_done >= warmup:
                 break
 
-    # Traced measurement phase
+    # Pass 1: Latency measurement (WITHOUT tracemalloc, using timed_score)
+    samples_s = np.zeros((repeats, len(tiles_list)), dtype=np.float64)
+    for r in range(repeats):
+        for idx, tile in enumerate(tiles_list):
+            res = timed_score(scorer, tile)
+            samples_s[r, idx] = res.cost_seconds
+
+    # Pass 2: Peak memory measurement (WITH tracemalloc)
     tracemalloc.start()
     tracemalloc.reset_peak()
-
-    samples: list[float] = []
-    for _ in range(repeats):
-        for tile in tiles_list:
-            t0 = time.perf_counter_ns()
-            scorer.score(tile)
-            t1 = time.perf_counter_ns()
-            samples.append((t1 - t0) / 1_000_000_000.0)
-
+    for tile in tiles_list:
+        scorer.score(tile)
     _, peak_mem_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    median_sec = float(np.median(samples))
-    p95_sec = float(np.percentile(samples, 95))
-    mean_sec = float(np.mean(samples))
+    median_sec = float(np.median(samples_s))
+    p95_sec = float(np.percentile(samples_s, 95))
+    mean_sec = float(np.mean(samples_s))
 
     return {
         "scorer_name": scorer.name,
@@ -65,10 +64,8 @@ def benchmark_scorer(
         "median": median_sec,
         "p95": p95_sec,
         "mean": mean_sec,
-        "per_tile_samples": samples,
-        "samples": samples,
-        "peak_memory": peak_mem_bytes,
-        "peak_memory_bytes": peak_mem_bytes,
+        "samples_s": samples_s,
+        "peak_memory_bytes": int(peak_mem_bytes),
     }
 
 
@@ -76,6 +73,12 @@ def run_benchmark_cli() -> None:
     """CLI runner to benchmark scorers on synthetic tiles and record results."""
     parser = argparse.ArgumentParser(
         description="Benchmark Capstone tile scorers on synthetic tiles."
+    )
+    parser.add_argument(
+        "--scorers",
+        type=str,
+        default="s1,s2,random,fifo",
+        help="Comma-separated list of scorer names (default: s1,s2,random,fifo)",
     )
     parser.add_argument("--num-tiles", type=int, default=10, help="Number of tiles to test")
     parser.add_argument("--height", type=int, default=256, help="Tile height in pixels")
@@ -91,6 +94,8 @@ def run_benchmark_cli() -> None:
     )
     args = parser.parse_args()
 
+    scorer_names = [s.strip() for s in args.scorers.split(",") if s.strip()]
+
     print(f"Generating {args.num_tiles} synthetic tiles ({args.height}x{args.width})...")
     source = SyntheticTileSource(
         num_tiles=args.num_tiles,
@@ -100,7 +105,6 @@ def run_benchmark_cli() -> None:
     )
     tiles = list(source.tiles())
 
-    scorer_names = ["s1", "s2", "random", "fifo"]
     results: list[dict[str, Any]] = []
 
     print(f"Benchmarking scorers: {', '.join(scorer_names)}")
@@ -118,7 +122,7 @@ def run_benchmark_cli() -> None:
         mean_ms = bench["mean"] * 1000.0
         median_ms = bench["median"] * 1000.0
         p95_ms = bench["p95"] * 1000.0
-        peak_kb = bench["peak_memory"] / 1024.0
+        peak_kb = bench["peak_memory_bytes"] / 1024.0
 
         print(
             f"{name:<10} | {mean_ms:<10.3f} | {median_ms:<12.3f} | {p95_ms:<10.3f} | {peak_kb:<14.2f}"

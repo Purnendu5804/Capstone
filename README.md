@@ -22,7 +22,7 @@ make test
 make lint
 
 # Benchmark scorers on 256x256 synthetic tiles and output results to results/
-python -m capstone.scorers.timing
+python -m capstone.scorers.timing --scorers s1,s2,s2_mean,random,fifo
 ```
 
 ## Slicer Interface Specification (Tile Format)
@@ -75,13 +75,15 @@ Scorers compute an onboard priority score (`float`) for each tile. Higher scores
 ### Built-in Scorers
 
 1. **S1 Variance (`S1VarianceScorer`)**:
-   - Computes the pixel variance of a single spectral band in `float64` (default `"B08"`, falls back to channel 0).
-   - Serves as a fast indicator of surface texture and land heterogeneity.
+   - Computes pixel variance of a single spectral band in `float64` (default `"B08"`).
+   - `strict: bool = True`: raises `ValueError` if band is missing; when `strict=False`, warns once per instance and falls back to channel 0.
 2. **S2 Edge Density (`S2EdgeScorer`)**:
-   - Computes the mean Sobel gradient magnitude (`skimage.filters.sobel`) on the target band.
-   - Normalized by a configurable reflectance constant (default `10000.0`) so scores are independent of absolute scene illumination.
+   - Computes true edge density (`mode="density"`, returning fraction of pixels exceeding gradient `threshold` in `[0, 1]`) or mean Sobel gradient magnitude (`mode="mean_magnitude"`).
+   - Normalised by reflectance constant (default `10000.0`). Default `threshold=0.02`.
+   - *Note: The 0.02 default threshold is a placeholder to be calibrated on real tiles.*
+   - `strict: bool = True`: raises `ValueError` if band is missing; when `strict=False`, warns once per instance and falls back to channel 0.
 3. **Random Baseline (`RandomScorer`)**:
-   - Generates pseudo-random priority scores from uniform $[0.0, 1.0)$ using an explicit seed.
+   - Pure function of `(seed, tile_id)` mapped stably via `hashlib.blake2b` to $[0.0, 1.0)$, completely independent of call order.
 4. **FIFO Baseline (`FifoScorer`)**:
    - Assigns priority based on capture order (`-tile.timestamp`), ensuring earlier tiles receive higher scores.
 
@@ -96,9 +98,13 @@ class Scorer(Protocol):
 
 The helper `timed_score(scorer, tile) -> ScoreResult` measures execution cost in nanoseconds using `time.perf_counter_ns` (including preprocessing) and returns a validated `ScoreResult`.
 
+Latency and peak memory usage are measured in two separate passes: latency without `tracemalloc` distortion using `timed_score`, and peak memory with `tracemalloc`. `benchmark_scorer` returns `samples_s` of shape `(repeats, num_tiles)`, along with `median`, `p95`, `mean`, and `peak_memory_bytes`.
+
 ### Registry & Plugging in External Models
 
-Scorers are constructed dynamically using `build_scorer(name, **kwargs)`. Teammates can register external lightweight or preview models without modifying pipeline logic:
+Scorers are constructed dynamically using `build_scorer(name, **kwargs)`. Canonical names are `"s1"`, `"s2"` (edge density), `"s2_mean"` (mean Sobel magnitude), `"random"`, and `"fifo"`.
+
+Teammates can register external lightweight or preview models without modifying pipeline logic:
 
 ```python
 from capstone.contracts.types import Tile
@@ -119,9 +125,9 @@ register_scorer("s3", TeammatePreviewScorer)
 
 Benchmark scorer throughput and memory overhead using synthetic tiles:
 ```bash
-python -m capstone.scorers.timing --num-tiles 10 --height 256 --width 256 --repeats 20
+python -m capstone.scorers.timing --scorers s1,s2,s2_mean,random,fifo --num-tiles 10 --height 256 --width 256 --repeats 20
 ```
-This runs warmup and repeated measurements, records `mean`, `median`, `p95` latencies, and tracemalloc peak memory, and writes output to `results/scorer_benchmarks.csv`.
+Outputs execution latency metrics and tracemalloc peak memory to `results/scorer_benchmarks.csv`.
 
 ---
 
@@ -135,13 +141,14 @@ This runs warmup and repeated measurements, records `mean`, `median`, `p95` late
 - `ScoreResult` contract with documentation on scorer-relative scores.
 - `SyntheticTileSource` with 5 decoupled test patterns and `FolderTileSource` with `manifest.csv` / `labels.csv`.
 
-### Step 2: Scorers, Baselines & Timing Harness (Completed)
+### Step 2 & 2.5: Scorers, Baselines & Timing Harness (Completed)
 - `Scorer` Protocol and `timed_score` latency measurement harness.
-- `S1VarianceScorer`: Configurable band variance in float64.
-- `S2EdgeScorer`: Normalized mean Sobel edge gradient magnitude.
-- `RandomScorer` (seeded) and `FifoScorer` (capture order) baselines.
-- Extensible scorer registry with `build_scorer` and `register_scorer`.
-- `benchmark_scorer` harness and CLI (`python -m capstone.scorers.timing`) outputting to `results/scorer_benchmarks.csv`.
+- `S1VarianceScorer`: Configurable band variance in float64 with `strict` flag.
+- `S2EdgeScorer`: True edge density (`mode="density"`, `threshold=0.02`) and mean gradient magnitude (`mode="mean_magnitude"`) with `strict` flag.
+- `RandomScorer`: Pure function of `(seed, tile_id)` using blake2b stable hashing independent of call order.
+- `FifoScorer`: Capture-order baseline.
+- Scorer registry with canonical names (`s1`, `s2`, `s2_mean`, `random`, `fifo`) and alias mapping.
+- Two-pass `benchmark_scorer` harness and CLI (`python -m capstone.scorers.timing --scorers ...`).
 
 ### Not Done / Next Steps (Step 3+)
 - Bounded priority queue and onboard pipeline orchestrator.

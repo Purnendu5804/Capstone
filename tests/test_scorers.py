@@ -1,5 +1,7 @@
 """Tests for scorers (S1, S2), baselines, registry, and timing harness."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -36,7 +38,6 @@ class TestS1VarianceScorer:
         assert scorer.name == "s1"
 
     def test_constant_tile_variance_is_zero(self) -> None:
-        # Constant tile: all values identical across all channels
         pixels = np.full((32, 32, 4), 5000, dtype=np.uint16)
         tile = create_tile(pixels)
         scorer = S1VarianceScorer(band="B08")
@@ -67,20 +68,30 @@ class TestS1VarianceScorer:
         score2 = scorer.score(tile)
         assert score1 == score2
 
-    def test_band_selection_and_fallback(self) -> None:
+    def test_strict_mode_raises_on_missing_band(self) -> None:
         pixels = np.zeros((16, 16, 4), dtype=np.uint16)
-        # Assign distinct variance to channel 2 ("B04")
-        pixels[:, :, 2] = np.tile([1000, 9000], (16, 8)).astype(np.uint16)
+        tile = create_tile(pixels, band_names=("B02", "B03", "B04", "B08"))
+        scorer = S1VarianceScorer(band="B99", strict=True)
+        with pytest.raises(ValueError, match="Band 'B99' not found in tile.band_names"):
+            scorer.score(tile)
 
+    def test_non_strict_warns_once_and_falls_back(self) -> None:
+        pixels = np.zeros((16, 16, 4), dtype=np.uint16)
+        pixels[:, :, 0] = 500  # channel 0 has variance 0
         tile = create_tile(pixels, band_names=("B02", "B03", "B04", "B08"))
 
-        scorer_b04 = S1VarianceScorer(band="B04")
-        scorer_b02 = S1VarianceScorer(band="B02")
-        scorer_missing = S1VarianceScorer(band="B99")  # fallback to channel 0 ("B02")
+        scorer = S1VarianceScorer(band="B99", strict=False)
 
-        assert scorer_b04.score(tile) > 0.0
-        assert scorer_b02.score(tile) == pytest.approx(0.0, abs=1e-9)
-        assert scorer_missing.score(tile) == scorer_b02.score(tile)
+        # First call emits warning
+        with pytest.warns(UserWarning, match="Band 'B99' not found"):
+            score = scorer.score(tile)
+        assert score == pytest.approx(0.0, abs=1e-9)
+
+        # Second call should NOT emit another warning
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            score2 = scorer.score(tile)
+            assert score2 == pytest.approx(0.0, abs=1e-9)
 
 
 class TestS2EdgeScorer:
@@ -91,52 +102,83 @@ class TestS2EdgeScorer:
         assert isinstance(scorer, Scorer)
         assert scorer.name == "s2"
 
-    def test_constant_tile_edge_is_zero(self) -> None:
+    def test_constant_tile_is_zero_in_both_modes(self) -> None:
         pixels = np.full((32, 32, 4), 4000, dtype=np.uint16)
         tile = create_tile(pixels)
-        scorer = S2EdgeScorer(band="B08")
+
+        density_scorer = S2EdgeScorer(mode="density", threshold=0.02)
+        mag_scorer = S2EdgeScorer(mode="mean_magnitude")
+
+        assert density_scorer.score(tile) == pytest.approx(0.0, abs=1e-9)
+        assert mag_scorer.score(tile) == pytest.approx(0.0, abs=1e-9)
+
+    def test_checkerboard_has_higher_density_than_single_edge(self) -> None:
+        single_edge = np.zeros((32, 32, 4), dtype=np.uint16)
+        single_edge[:, 16:, :] = 8000
+        single_edge_tile = create_tile(single_edge)
+
+        # 4x4 checkerboard with many edges
+        grid_y, grid_x = np.ogrid[:32, :32]
+        checker_2d = np.where(((grid_y // 4) + (grid_x // 4)) % 2 == 1, 8000, 0).astype(np.uint16)
+        checker_pixels = np.repeat(checker_2d[:, :, None], 4, axis=2)
+        checker_tile = create_tile(checker_pixels)
+
+        scorer = S2EdgeScorer(mode="density", threshold=0.02)
+        single_density = scorer.score(single_edge_tile)
+        checker_density = scorer.score(checker_tile)
+
+        assert 0.0 <= single_density <= 1.0
+        assert 0.0 <= checker_density <= 1.0
+        assert checker_density > single_density
+
+    def test_density_bounded_in_zero_one(self) -> None:
+        rng = np.random.default_rng(99)
+        pixels = rng.integers(0, 65535, size=(32, 32, 4), dtype=np.uint16)
+        tile = create_tile(pixels)
+
+        scorer = S2EdgeScorer(mode="density", threshold=0.02)
         score = scorer.score(tile)
-        assert score == pytest.approx(0.0, abs=1e-9)
+        assert 0.0 <= score <= 1.0
 
-    def test_sharp_edge_is_larger(self) -> None:
-        const_pixels = np.full((32, 32, 4), 4000, dtype=np.uint16)
-        edge_pixels = np.zeros((32, 32, 4), dtype=np.uint16)
-        edge_pixels[:, :16, :] = 1000
-        edge_pixels[:, 16:, :] = 9000
-
-        const_tile = create_tile(const_pixels)
-        edge_tile = create_tile(edge_pixels)
-
-        scorer = S2EdgeScorer()
-        assert scorer.score(const_tile) == pytest.approx(0.0, abs=1e-9)
-        assert scorer.score(edge_tile) > 0.02
-        assert scorer.score(edge_tile) > scorer.score(const_tile)
-
-    def test_determinism_for_fixed_tile(self) -> None:
+    def test_threshold_monotonicity(self) -> None:
+        # A higher threshold must never give a higher edge density
         pixels = np.zeros((32, 32, 4), dtype=np.uint16)
         pixels[:16, :, :] = 8000
         tile = create_tile(pixels)
 
-        scorer = S2EdgeScorer()
-        score1 = scorer.score(tile)
-        score2 = scorer.score(tile)
-        assert score1 == score2
+        thresholds = [0.01, 0.02, 0.05, 0.10, 0.20]
+        densities = [
+            S2EdgeScorer(mode="density", threshold=t).score(tile) for t in thresholds
+        ]
 
-    def test_scale_normalisation(self) -> None:
-        pixels = np.zeros((32, 32, 4), dtype=np.uint16)
-        pixels[:, :16, :] = 1000
-        pixels[:, 16:, :] = 8000
-        tile = create_tile(pixels)
+        for i in range(len(densities) - 1):
+            assert densities[i] >= densities[i + 1]
 
-        scorer_10k = S2EdgeScorer(scale=10000.0)
-        scorer_20k = S2EdgeScorer(scale=20000.0)
+    def test_strict_mode_and_fallback(self) -> None:
+        pixels = np.zeros((16, 16, 4), dtype=np.uint16)
+        tile = create_tile(pixels, band_names=("B02", "B03", "B04", "B08"))
 
-        # Doubling the normalization constant should halve the resulting gradient magnitude
-        assert scorer_10k.score(tile) == pytest.approx(2.0 * scorer_20k.score(tile), rel=1e-5)
+        scorer_strict = S2EdgeScorer(band="B99", strict=True)
+        with pytest.raises(ValueError, match="Band 'B99' not found"):
+            scorer_strict.score(tile)
 
-    def test_invalid_scale_raises(self) -> None:
+        scorer_lenient = S2EdgeScorer(band="B99", strict=False)
+        with pytest.warns(UserWarning, match="Band 'B99' not found"):
+            score = scorer_lenient.score(tile)
+        assert score == pytest.approx(0.0, abs=1e-9)
+
+        # Subsequent call does not warn again
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            assert scorer_lenient.score(tile) == pytest.approx(0.0, abs=1e-9)
+
+    def test_invalid_parameters_raise(self) -> None:
         with pytest.raises(ValueError, match="strictly positive"):
             S2EdgeScorer(scale=0.0)
+        with pytest.raises(ValueError, match="non-negative"):
+            S2EdgeScorer(threshold=-0.1)
+        with pytest.raises(ValueError, match="mode must be"):
+            S2EdgeScorer(mode="invalid_mode")
 
 
 class TestTimedScore:
@@ -157,20 +199,40 @@ class TestTimedScore:
 class TestBaselines:
     """Tests for RandomScorer and FifoScorer."""
 
-    def test_random_scorer_respects_seed(self) -> None:
+    def test_random_scorer_pure_function_of_seed_and_tile_id(self) -> None:
         pixels = np.zeros((16, 16, 4), dtype=np.uint16)
-        tile = create_tile(pixels)
+        tile_a = create_tile(pixels, tile_id="tile_A")
+        tile_b = create_tile(pixels, tile_id="tile_B")
+        tile_c = create_tile(pixels, tile_id="tile_C")
 
-        scorer_a1 = RandomScorer(seed=42)
-        scorer_a2 = RandomScorer(seed=42)
-        scorer_b = RandomScorer(seed=999)
+        scorer = RandomScorer(seed=42)
 
-        scores_a1 = [scorer_a1.score(tile) for _ in range(5)]
-        scores_a2 = [scorer_a2.score(tile) for _ in range(5)]
-        scores_b = [scorer_b.score(tile) for _ in range(5)]
+        # Call in one order
+        score_a1 = scorer.score(tile_a)
+        score_b1 = scorer.score(tile_b)
+        score_c1 = scorer.score(tile_c)
 
-        assert scores_a1 == scores_a2
-        assert scores_a1 != scores_b
+        # Call in a completely different order
+        score_c2 = scorer.score(tile_c)
+        score_a2 = scorer.score(tile_a)
+        score_b2 = scorer.score(tile_b)
+
+        # Same tile must produce exact same score regardless of call order
+        assert score_a1 == score_a2
+        assert score_b1 == score_b2
+        assert score_c1 == score_c2
+
+        # Check values are in [0, 1)
+        for s in [score_a1, score_b1, score_c1]:
+            assert 0.0 <= s < 1.0
+
+        # Different seed produces different score
+        scorer_other = RandomScorer(seed=999)
+        assert scorer_other.score(tile_a) != score_a1
+
+    def test_random_scorer_has_no_reset(self) -> None:
+        scorer = RandomScorer()
+        assert not hasattr(scorer, "reset")
 
     def test_fifo_scorer_earlier_timestamp_higher_score(self) -> None:
         pixels = np.zeros((16, 16, 4), dtype=np.uint16)
@@ -181,7 +243,6 @@ class TestBaselines:
         early_score = scorer.score(early_tile)
         late_score = scorer.score(late_tile)
 
-        # Higher score means more valuable; earlier timestamp must receive higher score
         assert early_score > late_score
         assert early_score == -10.0
         assert late_score == -25.0
@@ -190,18 +251,35 @@ class TestBaselines:
 class TestRegistry:
     """Tests for scorer registry."""
 
+    def test_list_scorers_returns_only_canonical_names(self) -> None:
+        canonical = list_scorers()
+        expected = ["fifo", "random", "s1", "s2", "s2_mean"]
+        assert canonical == expected
+
     def test_build_builtin_scorers(self) -> None:
         s1 = build_scorer("s1")
         assert isinstance(s1, S1VarianceScorer)
 
         s2 = build_scorer("s2")
         assert isinstance(s2, S2EdgeScorer)
+        assert s2.mode == "density"
+
+        s2_mean = build_scorer("s2_mean")
+        assert isinstance(s2_mean, S2EdgeScorer)
+        assert s2_mean.mode == "mean_magnitude"
 
         rnd = build_scorer("random", seed=10)
         assert isinstance(rnd, RandomScorer)
 
         fifo = build_scorer("fifo")
         assert isinstance(fifo, FifoScorer)
+
+    def test_aliases_resolve_correctly(self) -> None:
+        s1_alias = build_scorer("s1_variance")
+        assert isinstance(s1_alias, S1VarianceScorer)
+
+        s2_alias = build_scorer("sobel")
+        assert isinstance(s2_alias, S2EdgeScorer)
 
     def test_unknown_scorer_raises(self) -> None:
         with pytest.raises(KeyError, match="Unknown scorer"):
@@ -226,20 +304,29 @@ class TestRegistry:
 class TestTimingHarness:
     """Tests for benchmark_scorer."""
 
-    def test_benchmark_returns_expected_keys(self) -> None:
+    def test_benchmark_returns_expected_keys_and_shape(self) -> None:
         pixels = np.full((16, 16, 4), 1000, dtype=np.uint16)
         tiles = [create_tile(pixels, tile_id=f"t_{i}") for i in range(3)]
         scorer = S1VarianceScorer()
 
         res = benchmark_scorer(scorer, tiles, warmup=2, repeats=5)
 
-        for key in ["median", "p95", "mean", "samples", "per_tile_samples", "peak_memory"]:
+        # Expected keys
+        for key in ["median", "p95", "mean", "samples_s", "peak_memory_bytes"]:
             assert key in res
 
-        assert len(res["samples"]) == 3 * 5
+        # Verify old keys are removed
+        for old_key in ["samples", "per_tile_samples", "peak_memory"]:
+            assert old_key not in res
+
+        # Verify samples_s shape is (repeats, num_tiles)
+        samples_s = res["samples_s"]
+        assert isinstance(samples_s, np.ndarray)
+        assert samples_s.shape == (5, 3)
+
         assert res["mean"] > 0.0
         assert res["median"] > 0.0
-        assert res["peak_memory"] >= 0
+        assert res["peak_memory_bytes"] >= 0
 
     def test_benchmark_empty_tiles_raises(self) -> None:
         scorer = S1VarianceScorer()
