@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import numpy as np
 import pytest
 
-from capstone.contracts.types import ScoreResult, Tile, TileSource
+from capstone.contracts.types import LabeledTileSource, ScoreResult, Tile, TileSource
 from capstone.sources.synthetic import SyntheticTileSource
 
 
@@ -44,21 +44,52 @@ class TestTileContract:
         with pytest.raises(FrozenInstanceError):
             tile.tile_id = "new_id"  # type: ignore[misc]
 
+    def test_pixels_writeable_false(self) -> None:
+        raw_pixels = np.ones((16, 16, 4), dtype=np.uint16)
+        tile = make_valid_tile(pixels=raw_pixels)
+
+        # Flag must be set to False
+        assert not tile.pixels.flags.writeable
+
+        # Direct mutation must raise ValueError
+        with pytest.raises(ValueError, match="read-only"):
+            tile.pixels[0, 0, 0] = 999
+
+    def test_defensive_copy_on_writeable_input(self) -> None:
+        raw_pixels = np.ones((16, 16, 4), dtype=np.uint16)
+        tile = make_valid_tile(pixels=raw_pixels)
+
+        # Mutating the input array must not affect the Tile's pixel buffer
+        raw_pixels[0, 0, 0] = 999
+        assert tile.pixels[0, 0, 0] == 1
+
+    def test_tile_hash(self) -> None:
+        t1 = make_valid_tile(tile_id="tile_X")
+        t2 = make_valid_tile(tile_id="tile_X")
+        t3 = make_valid_tile(tile_id="tile_Y")
+
+        assert hash(t1) == hash("tile_X")
+        assert hash(t1) == hash(t2)
+
+        # Test set and dict hashing
+        tile_set = {t1, t3}
+        assert t2 in tile_set
+        assert len(tile_set) == 2
+
+        tile_dict = {t1: "first", t3: "second"}
+        assert tile_dict[t2] == "first"
+
     def test_wrong_dtype(self) -> None:
-        # float32 instead of uint16
         with pytest.raises(ValueError, match="dtype must be uint16"):
             make_valid_tile(pixels=np.zeros((32, 32, 4), dtype=np.float32))
 
-        # uint8 instead of uint16
         with pytest.raises(ValueError, match="dtype must be uint16"):
             make_valid_tile(pixels=np.zeros((32, 32, 4), dtype=np.uint8))
 
     def test_wrong_shape_dimensions(self) -> None:
-        # 2D shape (H, W)
         with pytest.raises(ValueError, match="pixels must have 3 dimensions"):
             make_valid_tile(pixels=np.zeros((32, 32), dtype=np.uint16))
 
-        # 4D shape (N, H, W, C)
         with pytest.raises(ValueError, match="pixels must have 3 dimensions"):
             make_valid_tile(pixels=np.zeros((1, 32, 32, 4), dtype=np.uint16))
 
@@ -67,7 +98,6 @@ class TestTileContract:
             make_valid_tile(pixels=[[1, 2], [3, 4]])
 
     def test_band_names_mismatch(self) -> None:
-        # 3 band names for 4 channels
         with pytest.raises(ValueError, match="band_names count .* does not match"):
             make_valid_tile(band_names=("B02", "B03", "B04"))
 
@@ -120,6 +150,8 @@ class TestScoreResultContract:
         assert sr.scorer_name == "variance_scorer"
         assert sr.score == 0.85
         assert sr.cost_seconds == 0.0012
+        assert ScoreResult.__doc__ is not None
+        assert "comparable only within the same scorer" in ScoreResult.__doc__
 
     def test_negative_cost_raises(self) -> None:
         with pytest.raises(ValueError, match="cost_seconds must be a non-negative float"):
@@ -140,9 +172,10 @@ class TestScoreResultContract:
             )
 
 
-class TestTileSourceProtocol:
-    """Verify TileSource protocol compliance."""
+class TestProtocols:
+    """Verify TileSource and LabeledTileSource protocol compliance."""
 
-    def test_synthetic_source_conforms_to_protocol(self) -> None:
+    def test_synthetic_source_conforms_to_protocols(self) -> None:
         source = SyntheticTileSource(num_tiles=2, seed=42)
         assert isinstance(source, TileSource)
+        assert isinstance(source, LabeledTileSource)

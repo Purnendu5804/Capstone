@@ -23,7 +23,7 @@ install:
 		fi; \
 	fi
 	$(PIP) install --upgrade pip
-	$(PIP) install -e .
+	$(PIP) install -e ".[dev]"
 
 test:
 	$(PYTEST)

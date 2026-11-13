@@ -68,6 +68,14 @@ class Tile:
                 f"timestamp must be a non-negative float (seconds), got {self.timestamp!r}"
             )
 
+        # Ensure pixel buffer is immutable and defensively copied if writeable
+        if self.pixels.flags.writeable:
+            pixels_copy = self.pixels.copy()
+            pixels_copy.flags.writeable = False
+            object.__setattr__(self, "pixels", pixels_copy)
+        else:
+            self.pixels.flags.writeable = False
+
     @property
     def size_bytes(self) -> int:
         """Return raw memory size in bytes of the pixel buffer."""
@@ -87,10 +95,19 @@ class Tile:
             and np.array_equal(self.pixels, other.pixels)
         )
 
+    def __hash__(self) -> int:
+        """Hash based on tile_id."""
+        return hash(self.tile_id)
+
 
 @dataclass(frozen=True)
 class ScoreResult:
-    """Represents the output score and execution latency of a scorer for a tile."""
+    """Represents the output score and execution latency of a scorer for a tile.
+
+    Note:
+        Scores are raw values and are comparable only within the same scorer.
+        Different scorers may produce scores on entirely different scales.
+    """
 
     tile_id: str
     scorer_name: str
@@ -120,4 +137,13 @@ class TileSource(Protocol):
 
     def tiles(self) -> Iterator[Tile]:
         """Yield Tile objects in capture order."""
+        ...
+
+
+@runtime_checkable
+class LabeledTileSource(TileSource, Protocol):
+    """Protocol for tile providers that also provide an evaluation label per tile."""
+
+    def value(self, tile_id: str) -> float:
+        """Return the ground truth evaluation value for a given tile_id."""
         ...

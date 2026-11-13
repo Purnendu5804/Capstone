@@ -1,5 +1,5 @@
 """Contracts and interfaces for the pipeline."""
 
-from capstone.contracts.types import ScoreResult, Tile, TileSource
+from capstone.contracts.types import LabeledTileSource, ScoreResult, Tile, TileSource
 
-__all__ = ["ScoreResult", "Tile", "TileSource"]
+__all__ = ["LabeledTileSource", "ScoreResult", "Tile", "TileSource"]
