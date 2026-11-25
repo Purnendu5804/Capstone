@@ -145,17 +145,25 @@ The onboard queue enforces a strict physical memory cap in bytes (`max_bytes`), 
   1. Higher priority score first.
   2. Earlier capture timestamp first (`tile.timestamp`).
   3. Lexicographically smaller `tile_id` first.
-- **Implementation**: Implemented using standard library `heapq` with dual min/max tracking and lazy deletion for optimal performance and zero external dependencies.
+- **Implementation**: Implemented using standard library `heapq` with dual min/max tracking and lazy deletion. Whenever stale entries exceed `2 * live + 16`, both heaps are rebuilt in $O(N)$ to keep memory bounded.
 
-### 2. Downlink Simulator Model (`DownlinkSimulator`)
-Downlink passes represent ground station contact windows defined by `Pass(start_s, duration_s, bandwidth_bytes_per_s)`.
-- **Pass Capacity**: Total data budget per pass is `duration_s * bandwidth_bytes_per_s`.
-- **Atomicity**: Partial tiles are **never** transmitted. A tile is only downlinked if its full byte size fits within the remaining capacity of an active pass.
+### 2. Compute Model (`run_pipeline`)
+The pipeline simulates a single onboard scoring core and a bounded FIFO input buffer:
+- **Single-Core Scoring**: Each tile takes `cost_seconds * compute_speed_factor` simulated seconds to score, where `compute_speed_factor` converts measured host time into simulated onboard seconds (e.g. >1.0 for a slower radiation-hardened satellite CPU).
+- **FIFO Input Buffer (`input_buffer_bytes`)**: Tiles arrive at their capture `timestamp`. If the scorer is idle, scoring starts immediately. If the scorer is busy, arriving tiles wait in a FIFO input buffer. If adding the tile would exceed `input_buffer_bytes` (when not `None`), the tile is dropped unscored (`dropped_unscored_tile_ids`).
+- **Queue Entry & Deterministic Overrides**: A tile enters the priority queue only at its scoring-finish time. For exact repeatability in tests and experiments, `cost_override` can replace the live `timed_score` duration.
+- **Tile Conservation**: Every captured tile ends in exactly one outcome: `delivered_tiles`, `evicted_tile_ids`, `rejected_tile_ids`, `remaining_tile_ids`, or `dropped_unscored_tile_ids`.
+
+### 3. Downlink Simulator Model (`DownlinkSimulator`)
+Downlink passes represent non-overlapping ground station contact windows defined by `Pass(start_s, duration_s, bandwidth_bytes_per_s)`.
+- **Pass Capacity**: Total data budget per pass is `duration_s * bandwidth_bytes_per_s`. Overlapping passes are rejected at construction time.
+- **Atomicity & Head-of-Line Blocking**: Partial tiles are **never** transmitted. Tiles are popped strictly in priority order; if the highest-scoring tile does not fit in the remaining pass capacity, transmission for that pass stops immediately and the tile stays in the queue.
 - **Retention**: Tiles that do not fit in the current pass remain in the priority queue for subsequent passes.
-- **Delivered Telemetry**: Each transmitted tile records its delivery timestamp `sent_at_s` and latency `delay_s_since_capture = sent_at_s - tile.timestamp`.
+- **Delivered Telemetry**: Each transmitted tile records `sent_at_s = max(pass.start_s, now_s) + cumulative_bytes_sent / bandwidth` (so `delay_s_since_capture = sent_at_s - tile.timestamp` includes transmission time).
 
-### 3. What is NOT Modelled
+### 4. What is NOT Modelled
 To maintain clean abstraction boundaries and deterministic benchmarking, the following physical/operational factors are deliberately excluded:
+- **Multi-Core / Preemptive Scoring**: Scoring is strictly sequential on a single core without parallel workers or mid-tile preemption.
 - **Onboard Tile Compression**: Tiles are stored and transmitted as raw uncompressed arrays (`uint16`); variable-bitrate image compression (e.g., JPEG2000, CCSDS 122.0) is not simulated.
 - **Orbital Geo-Visibility & Elevation**: Contact windows are modelled as rectangular step functions with constant bandwidth, rather than dynamic RF link budgets varying with satellite elevation and antenna look angles.
 - **Atmospheric Attenuation & Retransmission**: Packet loss, bit errors, rain fade, and ARQ retransmission protocols are not modelled; passes deliver all budgeted bytes error-free.
@@ -181,12 +189,12 @@ To maintain clean abstraction boundaries and deterministic benchmarking, the fol
 - Scorer registry with canonical names (`s1`, `s2`, `s2_mean`, `random`, `fifo`) and alias mapping.
 - Two-pass `benchmark_scorer` harness and CLI (`python -m capstone.scorers.timing --scorers ...`).
 
-### Step 3: Priority Queue, Downlink Simulator & Pipeline Runner (Completed)
-- `BoundedPriorityQueue`: Byte-constrained priority queue with deterministic tie-breaking (score -> timestamp -> tile_id) and eviction tracking using heapq with lazy deletion.
-- `DownlinkSimulator`: Scheduled pass simulator enforcing atomic tile transfers and bandwidth budgets.
-- `run_pipeline`: Deterministic streaming pipeline orchestrator returning comprehensive `RunResult`.
-- Full test suite verifying capacity enforcement, eviction fidelity, pass limits, and end-to-end determinism.
+### Step 3 & 3.5: Priority Queue, Downlink Simulator, Compute Model & Pipeline Runner (Completed)
+- `BoundedPriorityQueue`: Byte-constrained priority queue with deterministic tie-breaking (score -> timestamp -> tile_id), eviction tracking, and automatic heap rebuilding when stale entries exceed `2 * live + 16`.
+- `DownlinkSimulator`: Non-overlapping pass simulator enforcing atomic tile transfers, head-of-line blocking, bandwidth budgets, and transmission-time-aware `sent_at_s`.
+- `run_pipeline`: Discrete-event streaming pipeline orchestrator with single-core compute model (`compute_speed_factor`, bounded FIFO `input_buffer_bytes`, `cost_override`) returning `RunResult` with `remaining_tile_ids` and `dropped_unscored_tile_ids`.
+- Full test suite verifying capacity enforcement, heap size bounds, eviction fidelity, pass limits, conservation invariant, and end-to-end determinism.
 
 ### Not Done / Next Steps (Step 4+)
-- Experiment configuration harness (YAML-driven configs).
 - Metrics evaluation (cumulative value downlinked, latency distributions, ground truth comparison).
+- Experiment configuration harness (YAML-driven configs) and Docker packaging.

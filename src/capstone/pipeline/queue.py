@@ -125,6 +125,32 @@ class BoundedPriorityQueue:
         """Number of active tiles in the queue."""
         return len(self._entries)
 
+    def tile_ids(self) -> list[str]:
+        """Return tile_ids of all tiles currently in the queue."""
+        return [entry.tile_id for entry in self._entries.values()]
+
+    def _rebuild_heaps(self) -> None:
+        """Rebuild both heaps from active entries to discard stale lazy-deleted items."""
+        self._min_heap = [
+            (PriorityKey(e.score, e.tile.timestamp, e.tile.tile_id), eid)
+            for eid, e in self._entries.items()
+        ]
+        self._max_heap = [
+            (ReversePriorityKey(e.score, e.tile.timestamp, e.tile.tile_id), eid)
+            for eid, e in self._entries.items()
+        ]
+        heapq.heapify(self._min_heap)
+        heapq.heapify(self._max_heap)
+
+    def _maybe_rebuild_heaps(self) -> None:
+        """Rebuild heaps whenever stale entries exceed 2x live entries + constant."""
+        live = len(self._entries)
+        threshold = 2 * live + 16
+        stale_min = len(self._min_heap) - live
+        stale_max = len(self._max_heap) - live
+        if stale_min > threshold or stale_max > threshold:
+            self._rebuild_heaps()
+
     def _insert(self, tile: Tile, score: float) -> None:
         """Insert a new entry and push onto internal heaps."""
         self._entry_counter += 1
@@ -166,6 +192,7 @@ class BoundedPriorityQueue:
         _, entry_id = heapq.heappop(self._max_heap)
         entry = self._entries.pop(entry_id)
         self._current_bytes -= entry.size_bytes
+        self._maybe_rebuild_heaps()
         return entry
 
     def _peek_lowest(self) -> tuple[int, QueueEntry] | None:
@@ -238,6 +265,7 @@ class BoundedPriorityQueue:
             self.evicted += len(evicted_entries)
             self._insert(tile, score)
             self.pushed += 1
+            self._maybe_rebuild_heaps()
             return [e.tile_id for e in evicted_entries]
 
         # Could not free enough space: restore all popped items and reject candidate
@@ -245,4 +273,5 @@ class BoundedPriorityQueue:
             self._insert(e.tile, e.score)
 
         self.rejected += 1
+        self._maybe_rebuild_heaps()
         return [tile.tile_id]

@@ -61,25 +61,36 @@ class DownlinkSimulator:
 
     def __init__(self, passes: list[Pass]) -> None:
         self.passes = sorted(passes, key=lambda p: p.start_s)
+        for i in range(1, len(self.passes)):
+            prev_p = self.passes[i - 1]
+            curr_p = self.passes[i]
+            if curr_p.start_s < prev_p.end_s:
+                raise ValueError(
+                    f"Passes must not overlap: {prev_p} (ends at {prev_p.end_s}) "
+                    f"overlaps with {curr_p} (starts at {curr_p.start_s})"
+                )
+
         self._remaining_capacity = [float(p.capacity_bytes) for p in self.passes]
+        self._bytes_sent = [0 for _ in self.passes]
 
     def is_pass_active(self, now_s: float) -> bool:
         """Check if any ground station contact pass is currently active at now_s."""
-        for p in self.passes:
-            if p.start_s <= now_s <= p.end_s:
-                return True
-        return False
+        return any(p.start_s <= now_s <= p.end_s for p in self.passes)
 
     def transmit(
         self,
         queue: BoundedPriorityQueue,
         now_s: float,
     ) -> list[DeliveredTile]:
-        """Transmit the highest-score tiles that fully fit into remaining active pass capacity."""
+        """Transmit the highest-score tiles that fully fit into remaining active pass capacity.
+
+        Head-of-line blocking: tiles are evaluated strictly in priority order; the best
+        tile that does not fit in the remaining pass capacity stops the pass immediately
+        (lower-scoring tiles behind it are not transmitted in this pass, and stay queued).
+        """
         delivered: list[DeliveredTile] = []
 
         for idx, p in enumerate(self.passes):
-            # Check if this pass is active at now_s
             if not (p.start_s <= now_s <= p.end_s):
                 continue
 
@@ -96,18 +107,23 @@ class DownlinkSimulator:
                         break
                     rem_cap -= popped.size_bytes
                     self._remaining_capacity[idx] = rem_cap
+                    self._bytes_sent[idx] += popped.size_bytes
 
-                    delay = max(0.0, now_s - popped.tile.timestamp)
+                    sent_at_s = (
+                        max(p.start_s, now_s)
+                        + self._bytes_sent[idx] / p.bandwidth_bytes_per_s
+                    )
+                    delay = max(0.0, sent_at_s - popped.tile.timestamp)
                     delivered.append(
                         DeliveredTile(
                             tile_id=popped.tile.tile_id,
                             score=popped.score,
-                            sent_at_s=now_s,
+                            sent_at_s=sent_at_s,
                             delay_s_since_capture=delay,
                         )
                     )
                 else:
-                    # Tile does not fit in remaining capacity; stays in queue
+                    # Head-of-line blocking: best tile does not fit, stop this pass
                     break
 
         return delivered
